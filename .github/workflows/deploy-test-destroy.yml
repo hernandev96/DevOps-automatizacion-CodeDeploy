@@ -1,0 +1,297 @@
+name: E2E Deploy Infra, App, Test ALB & Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      wait_minutes:
+        description: "Tiempo de espera antes de destruir la infraestructura (minutos)"
+        required: true
+        default: "5"
+        type: string
+      auto_destroy:
+        description: "Destruir automáticamente la infraestructura tras la espera"
+        required: true
+        default: true
+        type: boolean
+      test_requests:
+        description: "Peticiones por prueba de carga (scripts/test_alb.sh)"
+        required: false
+        default: "200"
+        type: string
+      test_concurrency:
+        description: "Concurrencia por prueba de carga (scripts/test_alb.sh)"
+        required: false
+        default: "10"
+        type: string
+      skip_auth_test:
+        description: "Omitir pruebas de endpoints autenticados con JWT (--skip-auth)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: e2e-deploy-lifecycle
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+env:
+  TF_DIR: ./infra/main
+  TF_VERSION: "1.10.3"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  e2e-lifecycle:
+    name: E2E Pipeline (Infra -> Deploy -> Test -> Destroy)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar credenciales AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Dar permisos de ejecución a los scripts
+        run: |
+          chmod +x scripts/*.sh
+
+      # ── 1. Despliegue de Infraestructura con Terraform ───────────────────────
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate
+
+      - name: Terraform Apply (Desplegar Infraestructura)
+        id: tf_apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply --auto-approve -input=false
+
+      - name: Exportar Outputs de Terraform
+        id: tf_outputs
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "🔍 Leyendo outputs generados por Terraform..."
+          TF_JSON=$(terraform output -json)
+
+          ALB_DNS=$(echo "$TF_JSON" | jq -r '.alb_dns_name.value // empty')
+          TG_ARN=$(echo "$TF_JSON" | jq -r '.target_group_arn.value // empty')
+          ASG_NAME=$(echo "$TF_JSON" | jq -r '.asg_name.value // empty')
+          S3_BUCKET=$(echo "$TF_JSON" | jq -r '.s3_bucket_name.value // empty')
+          CD_APP=$(echo "$TF_JSON" | jq -r '.codedeploy_app_name.value // empty')
+          CD_GROUP=$(echo "$TF_JSON" | jq -r '.codedeploy_deployment_group_name.value // empty')
+          REGION=$(echo "$TF_JSON" | jq -r '.aws_region.value // "${{ env.AWS_REGION }}"')
+          ECR_REGISTRY=$(echo "$TF_JSON" | jq -r '.ecr_registry_url.value // empty')
+          ECR_BACKEND=$(echo "$TF_JSON" | jq -r '.ecr_backend_repository_url.value // empty')
+          ECR_FRONTEND=$(echo "$TF_JSON" | jq -r '.ecr_frontend_repository_url.value // empty')
+
+          echo "alb_url=http://${ALB_DNS}" >> "$GITHUB_OUTPUT"
+          echo "alb_dns=${ALB_DNS}" >> "$GITHUB_OUTPUT"
+          echo "target_group_arn=${TG_ARN}" >> "$GITHUB_OUTPUT"
+          echo "asg_name=${ASG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "s3_bucket=${S3_BUCKET}" >> "$GITHUB_OUTPUT"
+          echo "codedeploy_app=${CD_APP}" >> "$GITHUB_OUTPUT"
+          echo "codedeploy_group=${CD_GROUP}" >> "$GITHUB_OUTPUT"
+          echo "aws_region=${REGION}" >> "$GITHUB_OUTPUT"
+          echo "ecr_registry=${ECR_REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "ecr_backend=${ECR_BACKEND}" >> "$GITHUB_OUTPUT"
+          echo "ecr_frontend=${ECR_FRONTEND}" >> "$GITHUB_OUTPUT"
+
+          echo "✅ Infraestructura desplegada con éxito:"
+          echo "   • ALB URL: http://${ALB_DNS}"
+          echo "   • ASG Name: ${ASG_NAME}"
+          echo "   • S3 Bucket: ${S3_BUCKET}"
+          echo "   • CodeDeploy App: ${CD_APP}"
+
+      # ── 2. Esperar que las instancias del ASG y el CodeDeploy Agent estén listos ───
+      - name: Esperar inicialización de instancias EC2 en ASG
+        id: wait_asg
+        run: |
+          ASG_NAME="${{ steps.tf_outputs.outputs.asg_name }}"
+          REGION="${{ steps.tf_outputs.outputs.aws_region }}"
+
+          echo "⏳ Esperando a que las instancias de Auto Scaling pasen a estado InService..."
+          aws autoscaling wait group-in-service \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --region "$REGION" || echo "⚠️ Warning o timeout en waiter de ASG, continuando..."
+
+          echo "⏳ Esperando 45 segundos adicionales para asegurar que el CodeDeploy Agent ha arrancado..."
+          sleep 45
+          echo "✅ Instancias inicializadas."
+
+      # ── 3. Ejecución del Script de Despliegue de la Aplicación ────────────────
+      - name: Ejecutar Script de Despliegue (deploy_local.sh)
+        id: deploy_app
+        run: |
+          echo "🚀 Ejecutando ./scripts/deploy_local.sh..."
+          ./scripts/deploy_local.sh
+
+      # ── 4. Comprobación de Disponibilidad del ALB (Health Check Readiness) ────
+      - name: Esperar disponibilidad y salud del ALB
+        id: wait_alb
+        run: |
+          ALB_URL="${{ steps.tf_outputs.outputs.alb_url }}"
+          TG_ARN="${{ steps.tf_outputs.outputs.target_group_arn }}"
+          REGION="${{ steps.tf_outputs.outputs.aws_region }}"
+
+          echo "⏳ Verificando disponibilidad del endpoint de salud ($ALB_URL/api/health)..."
+
+          MAX_ATTEMPTS=24
+          ATTEMPT=1
+          HEALTHY=false
+
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$ALB_URL/api/health" --max-time 5 || echo "000")
+            
+            HEALTHY_TARGETS=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TG_ARN" \
+              --region "$REGION" \
+              --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+              --output text 2>/dev/null || echo "0")
+            
+            echo "Intento $ATTEMPT/$MAX_ATTEMPTS — HTTP Code: $STATUS | Targets Saludables: $HEALTHY_TARGETS"
+
+            if [ "$STATUS" = "200" ] && [ "$HEALTHY_TARGETS" -gt 0 ]; then
+              HEALTHY=true
+              echo "✅ ALB saludable y respondiendo con éxito (HTTP 200)."
+              break
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 10
+          done
+
+          if [ "$HEALTHY" = false ]; then
+            echo "❌ Error: El ALB no respondió HTTP 200 o no tiene targets saludables tras el tiempo límite."
+            exit 1
+          fi
+
+      # ── 5. Ejecución del Script de Testeo del ALB ─────────────────────────────
+      - name: Ejecutar Script de Testeo del ALB (test_alb.sh)
+        id: test_alb
+        run: |
+          ALB_URL="${{ steps.tf_outputs.outputs.alb_url }}"
+          TG_ARN="${{ steps.tf_outputs.outputs.target_group_arn }}"
+          ASG_NAME="${{ steps.tf_outputs.outputs.asg_name }}"
+          REQUESTS="${{ inputs.test_requests || '200' }}"
+          CONCURRENCY="${{ inputs.test_concurrency || '10' }}"
+          REGION="${{ steps.tf_outputs.outputs.aws_region }}"
+          EXTRA_FLAGS=""
+
+          if [ "${{ inputs.skip_auth_test }}" = "true" ]; then
+            EXTRA_FLAGS="--skip-auth"
+          fi
+
+          echo "⚖️ Ejecutando pruebas de balanceo y rendimiento con test_alb.sh..."
+          ./scripts/test_alb.sh \
+            -u "$ALB_URL" \
+            --target-group "$TG_ARN" \
+            --asg-name "$ASG_NAME" \
+            -n "$REQUESTS" \
+            -c "$CONCURRENCY" \
+            -r "$REGION" \
+            -o "$GITHUB_WORKSPACE/report_test_alb.md" \
+            $EXTRA_FLAGS
+
+      - name: Publicar Reporte de Pruebas en el Step Summary
+        if: always() && steps.test_alb.outcome != 'skipped'
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/report_test_alb.md" ]; then
+            cat "$GITHUB_WORKSPACE/report_test_alb.md" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Subir Reporte como Artefacto del Workflow
+        if: always() && steps.test_alb.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-test-alb-${{ github.run_id }}
+          path: report_test_alb.md
+          if-no-files-found: ignore
+
+      # ── 6. Esperar cierto tiempo antes de destruir (Solo si todo fue exitoso) ─
+      - name: Esperar antes de destruir la infraestructura
+        id: wait_destroy
+        if: success() && steps.tf_apply.outcome == 'success' && (inputs.auto_destroy != false && inputs.auto_destroy != 'false')
+        run: |
+          WAIT_MIN="${{ inputs.wait_minutes || '5' }}"
+          if ! [[ "$WAIT_MIN" =~ ^[0-9]+$ ]]; then
+            WAIT_MIN=5
+          fi
+
+          WAIT_SEC=$((WAIT_MIN * 60))
+          echo "================================================================="
+          echo "⏳ PAUSA PROGRAMADA: Esperando $WAIT_MIN minuto(s) ($WAIT_SEC segundos)"
+          echo "   Todas las etapas previas fueron exitosas."
+          echo "   La infraestructura está activa y accesible:"
+          echo "   👉 Endpoint ALB: ${{ steps.tf_outputs.outputs.alb_url }}"
+          echo "================================================================="
+
+          if [ "$WAIT_SEC" -gt 0 ]; then
+            sleep "$WAIT_SEC"
+          fi
+          echo "✅ Tiempo de espera finalizado. Procediendo a destruir la infraestructura..."
+
+      # ── 7. Destrucción de la Infraestructura (Por espera o ante cualquier fallo) ─
+      - name: Destruir Infraestructura (Terraform Destroy)
+        id: tf_destroy
+        if: |
+          always() &&
+          steps.tf_apply.outcome != '' &&
+          steps.tf_apply.outcome != 'skipped' &&
+          (inputs.auto_destroy != false && inputs.auto_destroy != 'false' || failure())
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "================================================================="
+          if [ "${{ job.status }}" == "failure" ]; then
+            echo "🚨 ALERTA: Se detectó un fallo en una o más fases del workflow."
+            echo "🧹 Ejecutando destrucción de emergencia de la infraestructura en AWS para evitar costos..."
+          else
+            echo "🧹 Iniciando destrucción programada de la infraestructura con Terraform tras la espera..."
+          fi
+          echo "================================================================="
+
+          # Limpiar bucket S3 para asegurar destrucción impecable
+          S3_BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
+          if [ -n "$S3_BUCKET" ]; then
+            echo "🗑️ Vaciando bucket S3 ($S3_BUCKET)..."
+            aws s3 rm "s3://$S3_BUCKET" --recursive 2>/dev/null || true
+          fi
+
+          terraform destroy --auto-approve -input=false
+          echo "✅ Infraestructura destruida exitosamente."
+
+      # ── 8. Resumen Final del Pipeline ───────────────────────────────────────
+      - name: Resumen General del Pipeline
+        if: always()
+        run: |
+          echo "## 📋 Resumen del Flujo E2E" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Etapa | Estado |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🏗️ Infraestructura (Terraform Apply) | \`${{ steps.tf_apply.outcome || 'N/A' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🚀 Despliegue de Aplicación (CodeDeploy) | \`${{ steps.deploy_app.outcome || 'N/A' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚖️ Pruebas de Carga ALB (test_alb.sh) | \`${{ steps.test_alb.outcome || 'N/A' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⏳ Pausa / Espera | \`${{ steps.wait_destroy.outcome || 'N/A' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🧹 Destrucción de Infraestructura | \`${{ steps.tf_destroy.outcome || 'N/A' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Resultado Global del Job:** \`${{ job.status }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Ejecutado por:** \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY

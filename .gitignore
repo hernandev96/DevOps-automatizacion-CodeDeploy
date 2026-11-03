@@ -1,0 +1,115 @@
+# ==============================================================================
+# Git Ignore - Monorepo (Frontend, Backend, Terraform Infra)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Archivos del Sistema Operativo e IDEs
+# ------------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Editores y entornos
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# ------------------------------------------------------------------------------
+# Variables de Entorno y Secretos (Regla General)
+# ------------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# ------------------------------------------------------------------------------
+# Frontend (React / TypeScript / Node.js)
+# ------------------------------------------------------------------------------
+node_modules/
+build/
+dist/
+.eslintcache
+
+# Logs de gestores de paquetes
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ------------------------------------------------------------------------------
+# Backend (Python / FastAPI / Pytest)
+# ------------------------------------------------------------------------------
+# Byte-compiled / optimizados
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Distribución / empaquetado
+*.egg-info/
+*.egg
+.eggs/
+*.spec
+
+# Testing, cobertura y linters
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Infraestructura (Terraform / AWS)
+# ------------------------------------------------------------------------------
+
+# Terraform state files - NO commitees
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+**/terraform.tfstate.d/
+*.terraform.tfstate.lock.info
+
+# Terraform directories (plugins, modules, etc.)
+.terraform/
+**/.terraform/
+
+# Lock file - MANTENER COMMITEADO (recomendado)
+# Descomentar solo si sabes lo que haces:
+# .terraform.lock.hcl
+# **/.terraform.lock.hcl
+
+# Variables sensibles y overrides locales
+*.tfvars
+*.tfvars.json
+*.tfplan
+**/tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Archivos de configuración local de CLI
+.terraformrc
+terraform.rc
+.terraform/environment
