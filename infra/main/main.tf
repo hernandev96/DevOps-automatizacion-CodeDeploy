@@ -30,17 +30,18 @@ provider "aws" {
 }
 
 locals {
-  public_subnet_names   = ["gh-subnet-a", "gh-subnet-b"]
-  route_table_name      = "gh-route-table"
-  elb_security_group    = "gh-security-group-elb"
-  ec2_security_group    = "gh-security-group-ec2"
-  gateway_name          = "gh-gateway"
-  target_group_name     = "gh-tg"
-  load_balancer_name    = "gh-elb"
-  asg_name              = "gh-asg"
-  launch_template_name  = "gh-template"
-  codedeploy_app_name   = "mi-app"
-  deployment_group_name = "produccion"
+  public_subnet_names     = ["gh-subnet-a", "gh-subnet-b"]
+  route_table_name        = "gh-route-table"
+  elb_security_group      = "gh-security-group-elb"
+  ec2_security_group      = "gh-security-group-ec2"
+  gateway_name            = "gh-gateway"
+  target_group_name       = "gh-tg"
+  target_group_green_name = "gh-tg-green"
+  load_balancer_name      = "gh-elb"
+  asg_name                = "gh-asg"
+  launch_template_name    = "gh-template"
+  codedeploy_app_name     = "mi-app"
+  deployment_group_name   = "produccion"
 }
 
 # ==============================================================================
@@ -335,6 +336,8 @@ resource "aws_lb" "main" {
   }
 }
 
+# El target group app_tg es el Target group principal que apunta a las instancias del ASG. 
+# Se puede cambiar a green para hacer un despliegue Blue/Green.
 resource "aws_lb_target_group" "app_tg" {
   name        = local.target_group_name
   port        = var.app_port
@@ -362,6 +365,33 @@ resource "aws_lb_target_group" "app_tg" {
     Environment = var.environment
   }
 }
+# 
+resource "aws_lb_target_group" "green" {
+  name        = local.target_group_green_name
+  port        = var.app_port
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "instance"
+
+  deregistration_delay = var.deregistration_delay
+
+  health_check {
+    enabled             = true
+    path                = var.health_check_path
+    port                = "traffic-port"
+    protocol            = "HTTP"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    matcher             = "200"
+  }
+
+  tags = {
+    Name        = local.target_group_green_name
+    Environment = var.environment
+  }
+}
 
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
@@ -371,6 +401,9 @@ resource "aws_lb_listener" "http" {
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.app_tg.arn
+  }
+  lifecycle {
+    ignore_changes = [default_action]
   }
 }
 
@@ -551,7 +584,26 @@ resource "aws_iam_role" "codedeploy_service_role" {
     Environment = var.environment
   }
 }
+resource "aws_iam_role_policy" "codedeploy_bluegreen_ec2" {
+  name = "${var.project_name}-codedeploy-bluegreen-ec2"
+  role = aws_iam_role.codedeploy_service_role.id
 
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ec2:RunInstances", "ec2:CreateTags"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = aws_iam_role.ec2_app_role.arn
+      }
+    ]
+  })
+}
 resource "aws_iam_role_policy_attachment" "codedeploy_service" {
   role       = aws_iam_role.codedeploy_service_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole"
@@ -567,15 +619,35 @@ resource "aws_codedeploy_deployment_group" "main" {
   # Despliegue al Auto Scaling Group (en lugar de EC2 fija por tag)
   autoscaling_groups = [aws_autoscaling_group.app_asg.name]
 
-  # Tipo In-Place coordinado con el Target Group para drenar tráfico durante la actualización
+  # Tipo Blue/Green coordinado con el Target Group para drenar tráfico durante la actualización
   deployment_style {
-    deployment_type   = "IN_PLACE"
+    deployment_type   = "BLUE_GREEN"
     deployment_option = "WITH_TRAFFIC_CONTROL"
+  }
+  blue_green_deployment_config {
+    deployment_ready_option {
+      action_on_timeout = "CONTINUE_DEPLOYMENT"
+    }
+    green_fleet_provisioning_option {
+      action = "COPY_AUTO_SCALING_GROUP" # sin esto el despliegue no puede crear el entorno verde
+    }
+    terminate_blue_instances_on_deployment_success {
+      action                           = "TERMINATE"
+      termination_wait_time_in_minutes = 5
+    }
   }
 
   load_balancer_info {
-    target_group_info {
-      name = aws_lb_target_group.app_tg.name
+    target_group_pair_info {
+      prod_traffic_route {
+        listener_arns = [aws_lb_listener.http.arn]
+      }
+      target_group {
+        name = aws_lb_target_group.app_tg.name # azul
+      }
+      target_group {
+        name = aws_lb_target_group.green.name
+      }
     }
   }
 
@@ -589,5 +661,8 @@ resource "aws_codedeploy_deployment_group" "main" {
   auto_rollback_configuration {
     enabled = true
     events  = ["DEPLOYMENT_FAILURE", "DEPLOYMENT_STOP_ON_ALARM"]
+  }
+  lifecycle {
+    ignore_changes = [autoscaling_groups]
   }
 }

@@ -191,7 +191,7 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
 
   dimensions = {
     LoadBalancer = aws_lb.main.arn_suffix
-    TargetGroup  = aws_lb_target_group.app_tg.arn_suffix
+
   }
 }
 
@@ -215,7 +215,7 @@ resource "aws_cloudwatch_metric_alarm" "healthy_hosts" {
 
   dimensions = {
     LoadBalancer = aws_lb.main.arn_suffix
-    TargetGroup  = aws_lb_target_group.app_tg.arn_suffix
+
   }
 }
 
@@ -351,7 +351,7 @@ resource "aws_cloudwatch_dashboard" "main" {
           period  = 60
           title   = "Errores 5xx (del ALB)"
           metrics = [
-            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", aws_lb.main.arn_suffix, "TargetGroup", aws_lb_target_group.app_tg.arn_suffix, { label = "5xx" }]
+            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", aws_lb.main.arn_suffix, { label = "5xx" }]
           ]
         }
       },
@@ -370,7 +370,7 @@ resource "aws_cloudwatch_dashboard" "main" {
           period  = 60
           title   = "Instancias sanas en el target group"
           metrics = [
-            ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", aws_lb_target_group.app_tg.arn_suffix, "LoadBalancer", aws_lb.main.arn_suffix, { label = "healthy" }]
+            ["AWS/ApplicationELB", "HealthyHostCount", "LoadBalancer", aws_lb.main.arn_suffix, { label = "healthy" }]
           ]
         }
       },

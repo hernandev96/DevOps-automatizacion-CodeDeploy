@@ -1,164 +1,250 @@
-# Taller de DevOps con un Monorepositorio — AWS & Terraform
+# Calculadora FullStack en AWS — Terraform, Blue/Green y Observabilidad
 
-Este repositorio implementa un flujo integral de **DevOps** para el aprovisionamiento, integración continua, entrega continua (CI/CD) y despliegue automatizado de una aplicación *FullStack* (**Calculadora: React + FastAPI + Nginx**) en la nube de **Amazon Web Services (AWS)**.
-
-Combina **Infraestructura como Código (IaC)** con **Terraform**, contenerización con **Docker / Docker Compose**, pipelines automatizados con **GitHub Actions** utilizando autenticación sin claves mediante **OpenID Connect (OIDC)**, registro de imágenes en **Amazon ECR**, artefactos en **Amazon S3**, y orquestación de despliegues controlados con **AWS CodeDeploy** sobre un **Auto Scaling Group (ASG)** detrás de un **Application Load Balancer (ALB)**.
-
----
-
-## 🏗️ Arquitectura de la Solución
+Repositorio de práctica DevOps que aprovisiona en **AWS**, mediante **Infraestructura como Código (Terraform)**, una aplicación _FullStack_ (**React + Nginx / FastAPI**) lista para producción, con **despliegue Blue/Green**, **rollback automático** y **observabilidad con CloudWatch**.
 
 ![Flujo de despliegue y construcción](./images/monorepo-aws.drawio.svg)
 
-### Componentes de Infraestructura
+---
 
-1. **Red y Alta Disponibilidad (VPC Multi-AZ):**
-   - VPC personalizada con Internet Gateway y subredes públicas distribuidas en múltiples zonas de disponibilidad (*Availability Zones*).
-   - Application Load Balancer (**ALB**) público como punto de entrada único (puerto `80`), con comprobación de salud continua (*Health Checks*) hacia `/api/health`.
+## 1. Propósito del proyecto
 
-2. **Cómputo Escalable y Seguro (EC2 / ASG):**
-   - **Auto Scaling Group (ASG)** administrado con Launch Template sobre *Amazon Linux 2023*.
-   - Comprobaciones de estado delegadas al balanceador (`health_check_type = "ELB"`).
-   - *Security Groups* con principio de menor privilegio: las instancias EC2 **solo** reciben tráfico HTTP proveniente del Security Group del ALB.
-   - Administración remota y segura mediante **AWS Systems Manager (SSM)** sin necesidad de exponer puertos SSH (puerto `22`).
+Este proyecto no busca solo “subir una app a EC2”. Su propósito es demostrar, de forma reproducible y automatizable, el **ciclo completo de vida de una aplicación en la nube**:
 
-3. **Almacenamiento y Registro de Contenedores:**
-   - **Amazon ECR**: Repositorios dedicados para backend (`calculadora/backend`) y frontend (`calculadora/frontend`) con escaneo de vulnerabilidades al hacer push (*scan on push*).
-   - **Amazon S3**: Bucket con versionado y cifrado del lado del servidor (AES-256) para almacenar los paquetes de revisión (*bundles*) de CodeDeploy.
+1. **Aprovisionar infraestructura** (red, cómputo, balanceo, registro, despliegue, observabilidad) sin tocar la consola.
+2. **Construir y publicar imágenes** de _backend_ y _frontend_ en un registro privado.
+3. **Desplegar con Blue/Green** sin tiempo fuera de servicio, con control de tráfico.
+4. **Hacerse reversible en segundos**: si el despliegue produce errores, se revierte automáticamente.
+5. **Observar todo**: métricas, logs, alarmas y dashboard en CloudWatch, sin instalar nada a mano en cada instancia.
+6. **Automatizar CI/CD con GitHub Actions + OIDC**: sin claves estáticas de AWS en el repositorio.
 
-4. **Despliegue Continuo con Tráfico Controlado:**
-   - **AWS CodeDeploy**: Aplicación y Deployment Group configurados con despliegue *In-Place* y control de tráfico (*Traffic Control* coordinado con el Target Group del ALB) y *Rollback* automático ante fallos.
+### Objetivos pedagógicos / funcionales
 
-5. **Seguridad y Autenticación CI/CD:**
-   - Autenticación federada **OIDC (OpenID Connect)** entre GitHub Actions y AWS IAM, eliminando el uso de `AWS_ACCESS_KEY_ID` o credenciales estáticas de larga duración.
+| Objetivo            | Cómo se cumple                                                                                        |
+| ------------------- | ----------------------------------------------------------------------------------------------------- |
+| Alta disponibilidad | VPC multi-AZ, ALB y ASG con mínimo 2 instancias                                                       |
+| Seguridad           | SGs de mínimo privilegio, IAM con menor privilegio, SSM sin SSH abierto, OIDC sin `AWS_ACCESS_KEY_ID` |
+| Despliegues seguros | CodeDeploy **Blue/Green + `WITH_TRAFFIC_CONTROL`** sobre ASG                                          |
+| Rollback automático | Alarma CloudWatch `gh-alb-5xx` registrada en el Deployment Group                                      |
+| Observabilidad      | Agent en cada EC2, logs centralizados, 5 alarmas, dashboard                                           |
+| Trazabilidad        | Imágenes con tag = _short-hash_ de git + `latest`, bundles versionados en S3                          |
+| Economía            | `terraform destroy` limpio; workflows con pausa y destrucción opcional                                |
+
+> **Regla de oro de la arquitectura:** el tráfico público **solo** entra por el **ALB**. Las instancias EC2 jamás escuchan directamente en Internet. El path es `Internet → ALB (80/443) → EC2 (80, desde SG del ALB) → Nginx → Backend`.
 
 ---
 
-## 📁 Estructura del Monorepositorio
+## 2. Stack tecnológico
 
-```text
-.
-├── .github/
-│   └── workflows/
-│       ├── ci-app.yml              # Pipeline CI: Pruebas de Backend (pytest), Frontend (Jest/build) y Docker
-│       ├── ci-terraform.yml        # Pipeline CI: Terraform format, validate y plan en PRs
-│       ├── cd-terraform-deploy.yml # Pipeline CD: Despliegue de Infraestructura + App, Health Check y Observabilidad
-│       └── deploy-test-destroy.yml # Pipeline E2E: Despliegue completo, pruebas de carga ALB y destrucción automática
-├── backend/                        # API REST en FastAPI (Python 3.9)
-│   ├── app/
-│   │   ├── core/                   # Configuración, logger estructurado, CORS, middleware y seguridad JWT
-│   │   ├── routers/                # Endpoints: auth, calculadora y health
-│   │   ├── schemas/                # Modelos de datos Pydantic
-│   │   └── services/               # Lógica de negocio
-│   ├── tests/                      # Pruebas automatizadas con pytest y httpx
-│   ├── Dockerfile                  # Imagen basada en python:3.9-alpine con usuario no-root
-│   ├── main.py                     # Punto de entrada de la aplicación
-│   └── requirements.txt            # Dependencias Python
-├── frontend/                       # Aplicación SPA en React (TypeScript)
-│   ├── src/
-│   │   ├── components/             # Componentes modulares (Display, NumberPad, OperationPad, etc.)
-│   │   ├── hooks/                  # Custom hooks (useAuth, useCalculadora)
-│   │   ├── services/               # Cliente HTTP / API service
-│   │   └── *.test.tsx              # Pruebas automatizadas con Jest y React Testing Library
-│   ├── nginx.conf.template         # Plantilla Nginx con reverse proxy /api/ hacia el backend
-│   ├── Dockerfile                  # Multi-stage build (Node 18 builder + Nginx unprivileged runtime)
-│   └── package.json                # Dependencias y scripts de React
-├── infra/                          # Infraestructura como Código (Terraform)
-│   ├── bootstrap/                  # Infraestructura inicial / remota (actualmente vacía)
-│   └── main/                       # Infraestructura principal (VPC, ALB, ASG, CodeDeploy, etc.)
-│       ├── main.tf                 # Definición de VPC, ALB, ASG, ECR, S3, IAM, CodeDeploy
-│       ├── variables.tf            # Parámetros y variables de configuración
-│       ├── outputs.tf              # Valores de salida (DNS del ALB, nombres de ECR, S3, etc.)
-│       └── user_data.sh            # Script de aprovisionamiento de EC2 (Docker, Compose, CodeDeploy Agent)
-├── scripts/                        # Scripts de ciclo de vida para CodeDeploy y despliegue local
-│   ├── before_install.sh           # Hook CodeDeploy: Limpieza de /opt/mi-app
-│   ├── after_install.sh            # Hook CodeDeploy: Permisos de ejecución
-│   ├── start_app.sh                # Hook CodeDeploy: Login ECR, pull de imágenes y docker compose up
-│   └── deploy_local.sh             # Script para compilar y desplegar a AWS desde tu terminal local
-├── docs/                           # Guías paso a paso para laboratorios manuales
-│   ├── iam.md                      # Configuración de roles y políticas IAM
-│   ├── ecr.md                      # Creación y autenticación de repositorios ECR
-│   ├── s3.md                       # Configuración de buckets S3 para CodeDeploy
-│   ├── vpc.md                      # Creación de VPC, subredes, IGW y tablas de ruteo
-│   ├── ec2.md                      # Creación y configuración de instancias EC2
-│   ├── codedeploy.md               # Configuración de aplicaciones y grupos en CodeDeploy
-│   └── cleanup.md                  # Procedimiento de limpieza y eliminación de recursos
-├── appspec.yml                     # Especificación leída por el agente de AWS CodeDeploy
-├── docker-compose.yml              # Orquestación de contenedores para producción
-└── README.md
-```
+| Capa                      | Tecnología / Servicio                                                              |
+| ------------------------- | ---------------------------------------------------------------------------------- |
+| **Backend**               | Python 3.9 + FastAPI + Uvicorn (imagen `python:3.9-alpine`, usuario no-root)       |
+| **Frontend**              | React + TypeScript + Nginx _unprivileged_ 1.27 (multi-stage: build Node 18)        |
+| **Contenedores**          | Docker + Docker Compose (orquesta `backend` + `frontend` en EC2)                   |
+| **IaC**                   | Terraform >= 1.0 (CI usa `1.10.3`), provider AWS ~> 5.0, provider `random` ~> 3.0  |
+| **Cómputo**               | EC2 Amazon Linux 2023 (`t3.micro`) + Launch Template + Auto Scaling Group          |
+| **Red / Balanceo**        | VPC, 2 subnets públicas, IGW, ALB (HTTP:80) + Target Groups azul/verde             |
+| **Registro / Artefactos** | ECR (2 repos, _scan on push_), S3 (bundles CodeDeploy, versionado + AES256)        |
+| **Despliegue**            | AWS CodeDeploy (Blue/Green, ASG + ALB) + agente en cada EC2                        |
+| **Observabilidad**        | CloudWatch Agent + Logs + Metric Alarms + Dashboard, config en SSM Parameter Store |
+| **CI/CD**                 | GitHub Actions + OIDC federado (`aws-actions/configure-aws-credentials@v4`)        |
+| **State remoto**          | S3 Backend (`use_lockfile` nativo) — ver §4.1                                      |
 
 ---
 
-## 🔄 Flujos de Integración y Despliegue Continuo (CI/CD)
-
-El repositorio incluye 3 flujos de trabajo en **GitHub Actions**:
+## 3. Arquitectura de la solución — visión general
 
 ```mermaid
-flowchart TD
-    subgraph FeatureBranch["Rama feature/*"]
-        A[Push a feature/*] --> B[tests.yaml]
-        B --> B1[Backend Tests: pytest]
-        B --> B2[Frontend Tests: npm test]
-    end
+flowchart TB
+    U[Internet / Usuario] -->|HTTP :80, HTTPS :443| ALB[(ALB gh-elb)]
+    ALB -->|listener :80| TG_BLUE[Target Group gh-tg AZUL]
+    ALB -->|traffic shift CodeDeploy| TG_GREEN[Target Group gh-tg-green VERDE]
+    TG_BLUE --> ASG[ASG gh-asg 2..4 instancias]
+    TG_GREEN --> ASG
+    ASG --> LT[Launch Template gh-template AL2023 t3.micro + IAM Profile + user_data]
+    LT --> EC2[EC2s con Docker, CodeDeploy Agent y CW Agent]
+    EC2 --> COMP[docker compose up: backend :8000 + frontend :80/3000]
 
-    subgraph PullRequest["Pull Request a main"]
-        B1 & B2 -->|Tests OK| C[Aprobación de PR y Merge]
-    end
-
-    subgraph MainBranch["Rama main"]
-        C --> D[build-deploy.yaml]
-        D --> D1[Auth AWS via OIDC]
-        D1 --> D2[Build & Push Docker Backend a ECR]
-        D1 --> D3[Build & Push Docker Frontend a ECR]
-        D2 & D3 --> D4[Empaquetar bundle appspec + scripts + compose]
-        D4 --> D5[Subir ZIP a Amazon S3]
-        D5 --> D6[Trigger AWS CodeDeploy]
-        D6 --> D7[EC2 ASG: Traffic Draining -> docker compose pull/up -> HealthCheck OK]
-    end
-
-    subgraph InfraPipeline["Infraestructura (Manual o Push a infra/main/)"]
-        E[terraform-deploy.yml] --> F[Terraform Plan & Apply]
-        F --> G[Actualizar Variables de GitHub automáticamente]
-    end
+    GHA[GitHub Actions OIDC] -->|terraform apply| TF[Terraform infra/main]
+    GHA -->|build/push| ECR[(ECR backend/frontend)]
+    GHA -->|zip bundle| S3[(S3 codedeploy-bucket)]
+    S3 -->|revisión| CODDEPLOY[CodeDeploy mi-app / produccion]
+    CODDEPLOY -->|Blue/Green sobre ASG| EC2
+    EC2 -->|logs /var/log/calculadora| CWAGENT[CloudWatch Agent]
+    CWAGENT --> CWLOGS[(Log Group /calculadora/calculadora)]
+    ALB -->|5xx| ALARM[gh-alb-5xx]
+    ALARM -->|rollback| CODDEPLOY
 ```
 
-### 1. `tests.yaml` — Pruebas en ramas de desarrollo
-- **Activación:** Cada `push` a ramas que coincidan con `feature/*`.
-- **Backend:** Configura Python 3.9, instala dependencias y ejecuta la suite de `pytest` sobre `backend/tests/`.
-- **Frontend:** Configura Node.js 18, instala dependencias y ejecuta `npm test -- --watchAll=false` con Jest y React Testing Library.
+### Flujo Blue/Green (resumen)
 
-### 2. `build-deploy.yaml` — Construcción y despliegue a AWS
-- **Activación:** Cada `push` a la rama `main`.
-- **Paso 1:** Se autentica en AWS usando el rol OIDC configurado en `AWS_ROLE_ARN`.
-- **Paso 2 (`backend-build`):** Construye la imagen Docker del backend y la sube a Amazon ECR con los tags `latest` y `${GITHUB_SHA}`.
-- **Paso 3 (`frontend-build`):** Construye la imagen Docker del frontend y la sube a Amazon ECR con los tags `latest` y `${GITHUB_SHA}`.
-- **Paso 4 (`deploy`):** Empaqueta los archivos de despliegue (`appspec.yml`, `docker-compose.yml`, `scripts/`), los sube al bucket S3 y crea un despliegue en AWS CodeDeploy.
-
-### 3. `terraform-deploy.yml` — Aprovisionamiento de Infraestructura
-- **Activación:** `push` en rutas de infraestructura o ejecución manual vía `workflow_dispatch` (opciones: `plan`, `apply`, `destroy`).
-- Realiza `terraform init`, `validate`, `plan`, `apply` y actualiza dinámicamente las variables del repositorio en GitHub mediante la API/CLI de GitHub.
-
-### 4. `deploy-test-destroy.yml` — Ciclo Completo E2E (Despliegue, App, Pruebas ALB y Destrucción)
-- **Activación:** Ejecución manual vía `workflow_dispatch` con parámetros configurables:
-  - `wait_minutes`: Tiempo de espera tras las pruebas antes de destruir (por defecto: 5 minutos).
-  - `auto_destroy`: Si debe destruir automáticamente la infraestructura (por defecto: `true`).
-  - `test_requests`: Número de peticiones para la prueba de carga del ALB (por defecto: `200`).
-  - `test_concurrency`: Nivel de concurrencia en las pruebas (por defecto: `10`).
-- **Flujo:**
-  1. Aprovisiona la infraestructura con Terraform (`terraform apply`).
-  2. Espera a que las instancias del Auto Scaling Group estén en estado `InService` y el CodeDeploy Agent inicializado.
-  3. Ejecuta el script de despliegue (`scripts/deploy_local.sh`), construyendo las imágenes Docker, subiéndolas a ECR, subiendo el bundle a S3 y disparando el despliegue con AWS CodeDeploy.
-  4. Espera a que el Application Load Balancer esté saludable (`/api/health` responda HTTP 200).
-  5. Ejecuta las pruebas de carga y balanceo con `scripts/test_alb.sh`, publicando el reporte en `$GITHUB_STEP_SUMMARY` y subiéndolo como artefacto.
-  6. Realiza una pausa programada (tiempo de espera) permitiendo interactuar con el entorno en vivo.
-  7. Destruye de forma segura y automatizada toda la infraestructura (`terraform destroy`), vaciando previamente buckets S3 y repositorios ECR.
+1. CodeDeploy crea una **flota verde** copiando el ASG (`COPY_AUTO_SCALING_GROUP`).
+2. En la flota verde instala la revisión desde S3 y levanta los contenedores nuevos.
+3. Valida el servicio (`/api/health` → 200).
+4. Mueve **todo el tráfico** del ALB del grupo azul al verde.
+5. Si todo va bien: termina las instancias azules (5 min de gracia).
+6. Si hay error 5xx (alarma) o fallo: **rollback automático** a la flota azul.
 
 ---
 
-## 📦 Orquestación de Despliegue con CodeDeploy
+## 4. Infraestructura en detalle
 
-El agente de CodeDeploy en cada instancia del ASG lee `appspec.yml` y ejecuta los hooks del ciclo de vida:
+La infraestructura se compone de **dos módulos Terraform independientes**:
+
+```
+infra/
+├── bootstrap/       # 1) Lo que se crea una vez: estado remoto + OIDC GitHub
+└── main/            # 2) La app en sí: VPC, ALB, ASG, ECR, S3, CodeDeploy, CloudWatch
+```
+
+### 4.1 `infra/bootstrap` — pre-requisitos para todo lo demás
+
+Se aplica **una sola vez** (estado local). Crea:
+
+| Recurso                                                                                                                    | Para qué                                                                                                                                      |
+| -------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Bucket S3 `infraestructura-calculadora-terraform-state` (versionado, AES256, sin acceso público, política que exige HTTPS) | Guarda el `terraform.tfstate` de `infra/main`                                                                                                 |
+| Tabla DynamoDB `calculadora-terraform-locks` (`PAY_PER_REQUEST`)                                                           | _Distributed locking_ del state (ver nota sobre `use_lockfile` abajo)                                                                         |
+| OIDC Provider `token.actions.githubusercontent.com` (reutilizable vía `create_oidc_provider = false`)                      | Identidad federada GitHub → AWS                                                                                                               |
+| Rol IAM `GitHubActionsMainDeployRole`                                                                                      | Asumible solo vía OIDC con _subject claims_ acotados (repo/rama)                                                                              |
+| Políticas                                                                                                                  | `terraform_state_access` (S3+DynamoDB), `main_infra_provisioning` (EC2/ELB/ASG/ECR/S3/CodeDeploy/CloudWatch/IAM acotado/SSM `/calculadora/*`) |
+
+> **Nota:** `infra/main/main.tf` hoy declara `backend "s3" { use_lockfile = true }` (lock nativo de S3, sin DynamoDB). El `backend_config_snippet` que emite `bootstrap/outputs.tf` es legacy con `dynamodb_table`. El comportamiento efectivo es: el lock lo hace S3; la tabla existe como respaldo/compatibilidad.
+
+**Variables clave de bootstrap** (`infra/bootstrap/variables.tf`): `aws_region`, `project_name`, `environment`, `state_bucket_name`, `create_oidc_provider`, `github_repository`, `github_branch`, `github_subject_claims`, `role_name`, `attach_admin_policy` (solo para talleres).
+
+**Outputs clave:** `state_bucket_name/arn`, `dynamodb_table_name/arn`, `github_oidc_provider_arn`, `github_actions_role_arn` (→ variable GitHub `AWS_ROLE_ARN`), `backend_config_snippet`.
+
+### 4.2 `infra/main` — la infraestructura de la aplicación
+
+Todo vive en `infra/main/` y se carga como **un solo módulo** (`main.tf` + `observability.tf` + `variables.tf` + `outputs.tf` + `user_data.sh`).
+
+#### 4.2.1 Red (VPC multi-AZ)
+
+- VPC `10.0.0.0/16` con DNS activado.
+- 2 subnets públicas: `10.0.1.0/24`, `10.0.2.0/24` en 2 AZs distintas (imprescindible para ALB HA).
+- IGW + tabla de rutas `0.0.0.0/0 → IGW`.
+- AMI resuelta por data source: la más reciente **Amazon Linux 2023 x86_64 HVM** (nada hardcodeado).
+
+#### 4.2.2 Security Groups (mínimo privilegio)
+
+| SG                                   | Entrada                                                                                                            | Salida                        |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | ----------------------------- |
+| `gh-security-group-elb` (ALB)        | 80 y 443 desde `0.0.0.0/0`                                                                                         | Todo (hacia instancias)       |
+| `gh-security-group-ec2` (instancias) | **Solo** `var.app_port` (80) **desde el SG del ALB**; SSH opcional vía `var.allowed_ssh_cidrs` (por defecto vacío) | Todo (pull ECR, S3, AWS APIs) |
+
+> Administrarse vía **SSM Session Manager**; el puerto 22 está cerrado por defecto.
+
+#### 4.2.3 IAM para las instancias (`calculadora-ec2-app-role`)
+
+El perfil de cada EC2 hereda:
+
+- `AmazonSSMManagedInstanceCore` (SSM).
+- `CloudWatchAgentServerPolicy` (publicar métricas/logs).
+- Política propia de lectura de S3 (solo el bucket de CodeDeploy).
+- Política propia de pull ECR (solo los 2 repos).
+- Política propia `ssm:GetParameter` **acotada al ARN exacto** del parámetro de config de CloudWatch Agent.
+
+#### 4.2.4 ALB + Target Groups (Blue/Green)
+
+- ALB `gh-elb` (público, `application`), subnets públicas, SG de ALB.
+- Listener HTTP `:80` → TG **azul** `gh-tg` (con `ignore_changes` en `default_action` para que CodeDeploy lo mueva).
+- TG **verde** `gh-tg-green` (mismo puerto/protocolo, health check idéntico).
+- Health check: `GET /api/health` → 200, cada 30 s, timeout 5 s, 2 sanos / 3 enfermos.
+- `deregistration_delay = 30 s` (variable) para drenado rápido.
+
+#### 4.2.5 Cómputo — Launch Template + ASG
+
+- Launch Template `gh-template` (AL2023, `t3.micro`, SG de instancias, IAM profile, `user_data` codificado).
+- ASG `gh-asg`: `min = 2, desired = 2, max = 4`, `health_check_type = "ELB"` (si falla el health del ALB, reemplaza), `health_check_grace_period = 300 s`, tags propagados.
+- **¿Por qué ELB y no EC2?** Con `EC2`, una instancia cuya app murió se seguiría considerando “sana”. Con `ELB`, el ASG la sustituye.
+
+#### 4.2.6 `user_data.sh` — cómo nace cada instancia
+
+Procesado con `templatefile()` (inyecta `aws_region`, `cw_agent_ssm_param`, `app_log_file_path`). Instala, en este orden:
+
+1. `dnf update`, Docker, Ruby (requerido por CodeDeploy), `wget`, `unzip`.
+2. AWS CLI v2 si falta.
+3. Servicio Docker + **Docker Compose v2** (binario + symlinks).
+4. **Directorio de logs** `/var/log/calculadora/calculadora.log` con permisos `777/666` (el directorio lo crea Docker como volumen root; backend y frontend escriben el mismo archivo con `tee`).
+5. **CodeDeploy Agent** (instalador específico de la región).
+6. `/opt/mi-app` de `ec2-user`.
+7. **CloudWatch Agent** + `fetch-config -c ssm:/calculadora/cloudwatch-agent/config` (al final a propósito: con `set -e`, un fallo de observabilidad no debe impedir que la instancia quede lista para CodeDeploy).
+
+#### 4.2.7 ECR + S3
+
+| Servicio                                          | Detalle                                                                                         |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| ECR `calculadora/backend`, `calculadora/frontend` | `MUTABLE`, `scan_on_push = true`, `force_delete` para `destroy` limpio                          |
+| S3 `calculadora-codedeploy-bucket-<random>`       | Versionado + AES256 + `force_destroy` (práctica). IAM de instancia con acceso de lectura mínimo |
+
+#### 4.2.8 CodeDeploy — Blue/Green sobre ASG + rollback
+
+- App `mi-app` (Server, `compute_platform = "Server"`).
+- Grupo `produccion`: `CodeDeployDefault.OneAtATime`, `autoscaling_groups = [gh-asg]`, `deployment_style = BLUE_GREEN + WITH_TRAFFIC_CONTROL`, `green_fleet_provisioning = COPY_AUTO_SCALING_GROUP`, `terminate_blue = TERMINATE (5 min)`, `action_on_timeout = CONTINUE_DEPLOYMENT`.
+- Rol `codedeploy-service-role`: `AWSCodeDeployRole` + política propia `ec2:RunInstances/CreateTags` + `iam:PassRole` acotado al rol EC2.
+- `alarm_configuration = [gh-alb-5xx]` + `auto_rollback = [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_ALARM]`.
+
+> **Por qué el rollback por alarma funciona:** la alarma `gh-alb-5xx` se evalúa con **1 solo periodo de 60 s** (`datapoints_to_alarm = 1`), así dispara _durante_ el despliegue. `treat_missing_data = "notBreaching"`: si no hay tráfico no hay 5xx, y eso no es un fallo.
+
+#### 4.2.9 Observabilidad (`observability.tf`)
+
+Una sola fuente de verdad vía _locals_:
+
+| Local                | Valor                                                                                                        |
+| -------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `cw_agent_ssm_param` | `/calculadora/cloudwatch-agent/config`                                                                       |
+| `app_log_group_name` | `/calculadora/calculadora` (retención `var.log_retention_days = 7`)                                          |
+| `app_log_file_path`  | `/var/log/calculadora/calculadora.log` (idéntica a la del `tee` en Compose y a la del `file_path` del Agent) |
+
+**Config del Agent** (en SSM, una sola vez, todas las instancias la leen al arrancar): métricas `mem/disk/swap` en namespace `CWAgent` con dimensiones `AutoScalingGroupName` / `InstanceId` + agregación por ASG; logs con _tail_ de `calculadora.log` (un stream por `instance_id`).
+
+**Alarmas:**
+
+| Alarma            | Métrica                              | Umbral                                    | `treat_missing_data` |
+| ----------------- | ------------------------------------ | ----------------------------------------- | -------------------- |
+| `gh-alb-5xx`      | `HTTPCode_Target_5XX_Count` (Sum)    | > 0 en 1 min                              | `notBreaching`       |
+| `gh-tg-healthy`   | `HealthyHostCount` (Minimum)         | < `asg_min_size` en 2 min                 | `breaching`          |
+| `gh-alb-p99`      | `TargetResponseTime` (p99)           | > `latency_p99_threshold_seconds` (0.5 s) | `notBreaching`       |
+| `gh-asg-cpu-high` | `CPUUtilization` (Average)           | > `cpu_alarm_threshold` (80 %)            | `notBreaching`       |
+| `gh-asg-mem-high` | `mem_used_percent` CWAgent (Average) | > `memory_alarm_threshold` (80 %)         | `notBreaching`       |
+
+`var.alarm_actions` (ARNs SNS, por defecto `[]`) permite enchufar notificaciones sin tocar código.
+
+**Dashboard `gh-miAppEstado`:** CPU, memoria, 5xx, instancias sanas, latencia p99 y últimos 50 logs (Logs Insights).
+
+---
+
+## 5. La aplicación (backend + frontend)
+
+### 5.1 Backend — FastAPI
+
+- Carpeta `backend/` (`main.py` + `app/{core,routers,schemas,services}` + `tests/` con pytest/httpx).
+- Routers: `auth`, `calculadora`, `health`, `boom` (este último, para demos de error).
+- Imagen `python:3.9-alpine`, usuario `appuser`, `uvicorn main:app --port 8000`.
+- En Compose: solo `expose: 8000` (no se publica al host; se accede vía frontend/nginx), _healthcheck_ interno a `/api/health`, logs por `tee -a /var/log/calculadora/calculadora.log`.
+
+### 5.2 Frontend — React + Nginx
+
+- Carpeta `frontend/` (`src/{components,hooks,services}` + tests Jest/RTL).
+- Build multi-stage: Node 18 → `nginxinc/nginx-unprivileged:1.27-alpine` (puerto 8080).
+- Plantilla `nginx.conf.template`: sirve la SPA y _reverse proxy_ `/api/` → `backend:8000`.
+- En Compose: publica `80:8080` (el que usa el ALB) y `3000:8080` (diagnóstico), `read_only`, `no-new-privileges`, logs por `tee` al mismo archivo compartido.
+
+### 5.3 `docker-compose.yml`
+
+```yaml
+services:
+  backend: # calculadora/backend:${APP_VERSION:-latest}
+  frontend: # calculadora/frontend:${APP_VERSION:-latest}
+```
+
+Ambos montan `/var/log/calculadora` (host) para el CW Agent. `start_app.sh` exporta `ECR_REGISTRY` (resuelto por IMDS/STS) y `APP_VERSION` (leída de `scripts/VERSION`), por lo que Compose siempre tira de la revisión exacta desplegada.
+
+---
+
+## 6. Cómo se despliega (CodeDeploy + hooks)
+
+### 6.1 `appspec.yml`
 
 ```yaml
 version: 0.0
@@ -166,145 +252,227 @@ os: linux
 files:
   - source: /
     destination: /opt/mi-app
-
 hooks:
-  BeforeInstall:
-    - location: scripts/before_install.sh
-      timeout: 60
-      runas: root
-  AfterInstall:
-    - location: scripts/after_install.sh
-      timeout: 60
-      runas: root
-  ApplicationStart:
-    - location: scripts/start_app.sh
-      timeout: 300
-      runas: root
+  BeforeInstall: scripts/before_install.sh # 60s
+  AfterInstall: scripts/after_install.sh # 60s
+  ApplicationStart: scripts/start_app.sh # 300s
+  ValidateService: scripts/validate_service.sh # 420s
 ```
 
-### Scripts de ciclo de vida:
-- **`scripts/before_install.sh`**: Prepara el directorio de despliegue `/opt/mi-app`.
-- **`scripts/after_install.sh`**: Asegura permisos de ejecución (`chmod +x`) sobre los scripts.
-- **`scripts/start_app.sh`**:
-  1. Detecta automáticamente la región y cuenta de AWS vía **IMDSv2** y **AWS STS**.
-  2. Autentica el daemon de Docker contra Amazon ECR usando el rol IAM asignado a la instancia EC2.
-  3. Ejecuta `docker compose pull` para descargar las imágenes más recientes.
-  4. Realiza el recambio ordenado con `docker compose down` y `docker compose up -d`.
-  5. Ejecuta `docker image prune -f` para evitar la saturación de disco.
+> El `ValidateService` es clave: es el último “portazo” antes de mover el tráfico.
+
+### 6.2 Scripts de ciclo de vida (`scripts/`)
+
+| Script                     | Qué hace                                                                                                                                  |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `before_install.sh`        | `rm -rf /opt/mi-app && mkdir -p /opt/mi-app` (nace limpio)                                                                                |
+| `after_install.sh`         | `chmod +x /opt/mi-app/scripts/*.sh`                                                                                                       |
+| `start_app.sh`             | Resuelve región/cuenta (IMDSv2 → STS), `docker login` ECR con el rol IAM, `compose pull/down/up -d`, `prune`                              |
+| `validate_service.sh`      | Espera opcional `VALIDATE_SLEEP` (demo de rollback) + reintenta `curl localhost/api/health` 12×5s → 200                                   |
+| `deploy_local.sh`          | Script **local** (no viaja en el bundle): lee outputs TF, login ECR, build+push, zip mínimo, `s3 cp`, `deploy create-deployment` + `wait` |
+| `test_alb.sh`              | Prueba de carga/balanceo del ALB (reporte `report_test_alb.md`)                                                                           |
+| `Prueba_observabilidad.sh` | Valida CloudWatch/CodeDeploy/ALB (reporte `reporte_observabilidad.md`)                                                                    |
+
+**Antes de la corrección**, `deploy_local.sh` copiaba **todo** `scripts/` al ZIP (incluía `test_alb.sh`, `Prueba_observabilidad.sh`, `.md`, el propio `deploy_local.sh`) y referenciaba un output `ec2_public_ips` que no existe. Hoy **solo empaqueta** los 4 hooks + `VERSION`/`VALIDATE_SLEEP`, con `--region` explícito en AWS CLI y sin bloque muerto de IPs.
 
 ---
 
-## 🚀 Guías de Ejecución y Uso
+## 7. Estructura del repositorio
 
-### Opción A: Desarrollo Local (Sin AWS)
-
-#### 1. Backend (FastAPI)
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate   # En Windows: venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+```text
+.
+├── .github/workflows/
+│   ├── ci-terraform.yml          # CI: fmt/validate/plan en PRs (comenta el plan)
+│   ├── cd-terraform-deploy.yml   # CD: apply → deploy → health → observabilidad → destroy
+│   └── deploy-test-destroy.yml   # E2E manual: apply → deploy → test ALB → destroy
+├── backend/                      # FastAPI (app/core, routers, schemas, services, tests)
+├── frontend/                     # React + TS (components, hooks, services, tests)
+├── infra/
+│   ├── bootstrap/                # S3 state + DynamoDB lock + OIDC + rol GitHub
+│   │   ├── main.tf  variables.tf  outputs.tf  README.md
+│   └── main/                     # VPC, ALB, ASG, ECR, S3, CodeDeploy, Observabilidad
+│       ├── main.tf               # Red, SG, IAM, ALB/TG, ASG, ECR, S3, CodeDeploy
+│       ├── observability.tf      # SSM, CW Agent, log group, alarmas, dashboard
+│       ├── variables.tf          # Parámetros (región, ASG, app_port, /api/health, alarmas)
+│       ├── outputs.tf            # alb_dns_name, ecr_*, s3_bucket, codedeploy_*, cw_*
+│       └── user_data.sh          # Docker, Compose, CodeDeploy y CW Agent
+├── scripts/                      # Hooks CodeDeploy + deploy_local + test_alb + Prueba_observabilidad
+├── docs/                         # Guías manuales paso a paso (iam, ecr, s3, vpc, ec2, codedeploy, cleanup)
+├── appspec.yml                   # Hooks CodeDeploy
+├── docker-compose.yml            # backend + frontend
+├── images/monorepo-aws.drawio.svg
+├── report_test_alb.md            # Reportes generados (no versionar a mano)
+├── reporte_observabilidad.md
+└── README.md
 ```
-- API Docs interactiva: [http://localhost:8000/docs](http://localhost:8000/docs)
-- Health check: [http://localhost:8000/api/health](http://localhost:8000/api/health)
-- Ejecutar tests: `pytest tests/`
-
-#### 2. Frontend (React)
-```bash
-cd frontend
-npm install
-npm start
-```
-- Aplicación: [http://localhost:3000](http://localhost:3000)
-- Ejecutar tests: `npm test`
 
 ---
 
-### Opción B: Aprovisionamiento de Infraestructura con Terraform
+## 8. CI/CD con GitHub Actions
 
-#### Prerrequisitos:
-- [AWS CLI v2](https://aws.amazon.com/cli/) instalada y configurada (`aws configure`).
-- [Terraform](https://www.terraform.io/) (versión >= 1.0) instalado.
+Autenticación siempre **OIDC** (sin claves estáticas): cada workflow asume `vars.AWS_ROLE_ARN` con `id-token: write`.
 
-#### Pasos:
+### 8.1 `ci-terraform.yml` — CI en Pull Requests
+
+- **Trigger:** `pull_request` a `main` con cambios en `infra/**` (+ manual).
+- **Pasos:** `fmt -check`, `validate`, `plan -out=tfplan`, publica el plan como comentario en el PR, falla si el plan falla.
+- **Para qué:** revisar infraestructura _antes_ de fusionar.
+
+### 8.2 `cd-terraform-deploy.yml` — CD infra + app
+
+- **Trigger:** `push` a `main` con cambios en `infra/main/**`, `scripts/**`, `backend/**`, `frontend/**`, `docker-compose.yml`, `appspec.yml` (+ `workflow_dispatch` con `wait_minutes`, `auto_destroy`, `skip_observability_test`).
+- **Concurrency:** `cd-deploy-production` (`cancel-in-progress: false` — nunca cancelar un `apply` a mitad).
+- **Flujo:** `init → validate → apply` → exporta outputs TF → espera ASG `InService` + 45 s (CodeDeploy Agent) → `./scripts/deploy_local.sh` → espera ALB `HTTP 200` + targets _healthy_ (24×10 s) → `Prueba_observabilidad.sh` (reporte + artefacto + Step Summary) → pausa → `destroy` (vacía S3 + `terraform destroy`) si `auto_destroy` o hubo fallo → resumen.
+
+### 8.3 `deploy-test-destroy.yml` — E2E con prueba de carga
+
+- **Trigger:** solo `workflow_dispatch` (`wait_minutes`, `auto_destroy`, `test_requests=200`, `test_concurrency=10`, `skip_auth_test`).
+- **Flujo:** igual que CD, pero en lugar de observabilidad ejecuta `test_alb.sh` (balanceo/rendimiento + endpoints JWT) y sube `report_test_alb.md` como artefacto.
+
+### Variables / Secrets de GitHub
+
+| Variable       | Descripción                                   |
+| -------------- | --------------------------------------------- |
+| `AWS_REGION`   | Región AWS (por defecto `us-east-1`)          |
+| `AWS_ROLE_ARN` | ARN del rol OIDC creado por `infra/bootstrap` |
+
+---
+
+## 9. Cómo ejecutar
+
+### Prerrequisitos
+
+- [AWS CLI v2](https://aws.amazon.com/cli/), [Docker](https://www.docker.com/), [Terraform](https://www.terraform.io/) >= 1.0, `jq`, `zip`, credenciales AWS configuradas.
+- Cuenta AWS con permisos para crear los recursos (o el rol bootstrap).
+
+### Paso 1 — Bootstrap (una vez)
+
 ```bash
-cd infra/main
-
-# Inicializar proveedores y módulos
+cd infra/bootstrap
 terraform init
-
-# Validar sintaxis y configuración
-terraform validate
-
-# Ver el plan de ejecución
-terraform plan
-
-# Aplicar y crear toda la infraestructura
 terraform apply
+# Copiar el ARN de github_actions_role_arn a la variable GitHub AWS_ROLE_ARN
+# y verificar el backend S3 que usa infra/main
 ```
 
-Al finalizar, Terraform mostrará los *outputs* clave, incluyendo el DNS público del balanceador (`alb_dns_name`).
-
----
-
-### Opción C: Despliegue Directo desde CLI Local (`deploy_local.sh`)
-
-Si ya aplicaste la infraestructura con Terraform y deseas compilar y desplegar directamente desde tu máquina local sin esperar a GitHub Actions:
-
-```bash
-# Asegúrate de tener permisos de ejecución
-chmod +x scripts/deploy_local.sh
-
-# Ejecutar el despliegue
-./scripts/deploy_local.sh
-```
-
-El script leerá automáticamente los outputs de Terraform en `infra/main/`, autenticará Docker en ECR, construirá y subirá las imágenes, subirá el paquete a S3 y disparará el despliegue en CodeDeploy monitoreando su progreso.
-
----
-
-### Opción D: Despliegue Automatizado con GitHub Actions
-
-1. En tu repositorio de GitHub, ve a **Settings → Secrets and variables → Actions**.
-2. En la pestaña **Variables**, define las siguientes variables (si no usas el workflow automatizado de Terraform):
-
-| Nombre de Variable | Descripción | Ejemplo de Valor |
-| :--- | :--- | :--- |
-| `AWS_REGION` | Región de AWS donde reside la infraestructura | `us-east-1` |
-| `AWS_ROLE_ARN` | ARN del Rol IAM configurado con Trust Policy OIDC para GitHub | `arn:aws:iam::123456789012:role/GitHubActionsDeployRole` |
-| `BACKEND_ECR_REGISTRY` | URL del repositorio ECR del backend | `123456789012.dkr.ecr.us-east-1.amazonaws.com/calculadora/backend` |
-| `FRONTEND_ECR_REGISTRY`| URL del repositorio ECR del frontend | `123456789012.dkr.ecr.us-east-1.amazonaws.com/calculadora/frontend` |
-| `S3_BUCKET` | Nombre del bucket S3 para revisiones de CodeDeploy | `calculadora-codedeploy-bucket-xxxx` |
-| `CODEDEPLOY_APP` | Nombre de la aplicación en CodeDeploy | `calculadora-codedeploy-app` |
-| `CODEDEPLOY_GROUP` | Nombre del grupo de despliegue en CodeDeploy | `calculadora-deployment-group` |
-
-3. Realiza tus cambios en una rama `feature/nueva-funcionalidad`, haz push y abre un Pull Request hacia `main`.
-4. Una vez integrados los cambios en `main`, el workflow `build-deploy.yaml` realizará el despliegue automáticamente.
-
----
-
-## 📚 Laboratorios y Guías Manuales (Docs)
-
-Si deseas realizar o estudiar cada paso de forma manual a través de la consola de AWS o AWS CLI, consulta las guías dedicadas en el directorio [`docs/`](./docs/):
-
-1. 🔐 [Configuración de IAM y OIDC](./docs/iam.md)
-2. 🐳 [Configuración de Repositorios ECR](./docs/ecr.md)
-3. 🪣 [Configuración de Bucket S3](./docs/s3.md)
-4. 🌐 [Configuración de Red y VPC](./docs/vpc.md)
-5. 🖥️ [Configuración de Instancia EC2](./docs/ec2.md)
-6. 🚀 [Configuración de AWS CodeDeploy](./docs/codedeploy.md)
-7. 🧹 [Limpieza y Eliminación de Recursos](./docs/cleanup.md)
-
----
-
-## 🧹 Limpieza y Destrucción de Recursos
-
-Para evitar cargos innecesarios en tu cuenta de AWS una vez concluido el taller o las pruebas:
+### Paso 2 — Infraestructura principal
 
 ```bash
 cd infra/main
+terraform init
+terraform validate
+terraform plan
+terraform apply
+# Guardar alb_dns_name  (terraform output alb_dns_name)
+```
+
+### Paso 3 — Despliegue local
+
+```bash
+chmod +x scripts/deploy_local.sh
+./scripts/deploy_local.sh
+# El script: lee outputs TF → build/push ECR → bundle ZIP → S3 → CodeDeploy
+```
+
+### Verificación
+
+```bash
+ALB=$(terraform -chdir=infra/main output -raw alb_dns_name)
+curl -s http://${ALB}/api/health   # debe responder 200
+curl -s http://${ALB}/             # SPA React
+```
+
+> Desde SSM Session Manager (`AWS-RunShellScript` / `AWS-StartInteractiveCommand`) se puede inspeccionar cada EC2 sin abrir SSH.
+
+### Desarrollo local (sin AWS)
+
+```bash
+# Backend
+cd backend && python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt && uvicorn main:app --reload --port 8000
+# Frontend
+cd frontend && npm install && npm start   # http://localhost:3000
+```
+
+---
+
+## 10. Variables y outputs Terraform (referencia)
+
+### Variables (`infra/main/variables.tf`)
+
+| Variable                                         | Defecto                      | Significado                                   |
+| ------------------------------------------------ | ---------------------------- | --------------------------------------------- |
+| `aws_region`                                     | `us-east-1`                  | Región                                        |
+| `project_name`                                   | `calculadora`                | Prefijo de recursos / ECR / SSM               |
+| `environment`                                    | `production`                 | Tag de entorno                                |
+| `vpc_cidr`                                       | `10.0.0.0/16`                | VPC                                           |
+| `public_subnet_cidrs`                            | `[10.0.1.0/24, 10.0.2.0/24]` | 2 subnets públicas                            |
+| `instance_type`                                  | `t3.micro`                   | EC2                                           |
+| `asg_min_size/desired/max`                       | `2 / 2 / 4`                  | ASG                                           |
+| `health_check_grace_period`                      | `300`                        | Gracia tras lanzar                            |
+| `app_port`                                       | `80`                         | Puerto de la app (Nginx)                      |
+| `health_check_path`                              | `/api/health`                | Health del TG                                 |
+| `deregistration_delay`                           | `30`                         | Drenado ALB                                   |
+| `allowed_ssh_cidrs`                              | `[]`                         | SSH (vacío = solo SSM)                        |
+| `log_retention_days`                             | `7`                          | Retención de logs                             |
+| `cpu_alarm_threshold` / `memory_alarm_threshold` | `80 / 80`                    | Alarmas ASG                                   |
+| `latency_p99_threshold_seconds`                  | `0.5`                        | p99 ALB (segundos)                            |
+| `alarm_actions`                                  | `[]`                         | ARNs SNS                                      |
+| `codedeploy_traffic_control`                     | `true`                       | Documental: Blue/Green con control de tráfico |
+
+### Outputs (`infra/main/outputs.tf`)
+
+`alb_dns_name`, `alb_arn`, `target_group_arn/name`, `vpc_id`, `public_subnet_ids`, `asg_name/arn`, `launch_template_id`, `ecr_backend/frontend_repository_url`, `ecr_registry_url`, `s3_bucket_name`, `codedeploy_app_name`, `codedeploy_deployment_group_name`, `aws_region`, `cloudwatch_dashboard_name`, `app_log_group_name`, `codedeploy_alarm_name`.
+
+`deploy_local.sh` consume: `aws_region`, `ecr_registry_url`, `ecr_backend/frontend_repository_url`, `s3_bucket_name`, `codedeploy_app_name`, `codedeploy_deployment_group_name`, `alb_dns_name`.
+
+---
+
+## 11. Observabilidad y pruebas
+
+| Prueba               | Script                                                                                                                                         | Qué demuestra                                                                                       |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Balanceo / carga ALB | `scripts/test_alb.sh` (`-u URL -n 200 -c 10 --target-group --asg-name -r region -o report_test_alb.md`)                                        | URLs servidas, distribución entre instancias, latencia, endpoints autenticados                      |
+| Observabilidad       | `scripts/Prueba_observabilidad.sh` (`-u -r -a mi-app -g produccion -t TG -l loggroup -d dashboard -m gh-alb-5xx -o reporte_observabilidad.md`) | Logs recientes, métricas, alarmas, estado del grupo de despliegue                                   |
+| Demo de rollback     | `VALIDATE_SLEEP_SECONDS=120 ./scripts/deploy_local.sh`                                                                                         | La espera en `validate_service.sh` da tiempo a que la alarma 5xx dispare y CodeDeploy haga rollback |
+
+Los reportes se publican en el **Step Summary** y como **artefactos** de GitHub Actions.
+
+---
+
+## 12. Guías manuales (`docs/`)
+
+Si prefieres recorrer cada servicio a mano (consola / AWS CLI) antes de automatizar, hay guías paso a paso:
+
+1. [IAM y OIDC](./docs/iam.md)
+2. [ECR](./docs/ecr.md)
+3. [S3](./docs/s3.md)
+4. [VPC y red](./docs/vpc.md)
+5. [EC2](./docs/ec2.md)
+6. [CodeDeploy](./docs/codedeploy.md)
+7. [Limpieza](./docs/cleanup.md)
+
+---
+
+## 13. Limpieza
+
+Para no dejar costos corriendo:
+
+```bash
+cd infra/main
+# Vaciar el bucket de artefactos (si terraform destroy falla por objetos)
+aws s3 rm "s3://$(terraform output -raw s3_bucket_name)" --recursive
 terraform destroy -auto-approve
 ```
 
-O consulta la [Guía de Limpieza Manual](./docs/cleanup.md) si creaste recursos a través de la consola o AWS CLI.
+Y, si aplica, destruir también el bootstrap (`infra/bootstrap`) y el state remoto.
+
+---
+
+## 14. Notas y decisiones de diseño
+
+- **Por qué `use_lockfile` y no DynamoDB en `main`:** el lock nativo de S3 es más simple para trabajo colaborativo en este proyecto. DynamoDB sigue en `bootstrap` como respaldo/compatibilidad.
+- **Por qué `health_check_type = "ELB"`:** el ASG debe saber si la _app_ está sana, no solo si la instancia encendió.
+- **Por qué la alarma de rollback tiene 1 periodo:** el rollback por alarma solo actúa _mientras_ el despliegue está en curso; una alarma lenta nunca dispararía.
+- **Por qué el bundle es mínimo:** solo viajan `appspec.yml`, `docker-compose.yml` y los 4 hooks + `VERSION`/`VALIDATE_SLEEP`. Menos superficie, menos ruido.
+- **Por qué `deploy_local.sh` no imprime IPs EC2:** no existe output `ec2_public_ips` y la arquitectura ya las oculta detrás del ALB. Si necesitas diagnóstico por instancia, usa SSM Session Manager.

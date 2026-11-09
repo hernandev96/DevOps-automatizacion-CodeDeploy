@@ -31,7 +31,6 @@ S3_BUCKET=$(echo "$TF_JSON" | jq -r '.s3_bucket_name.value // empty')
 CODEDEPLOY_APP=$(echo "$TF_JSON" | jq -r '.codedeploy_app_name.value // empty')
 CODEDEPLOY_GROUP=$(echo "$TF_JSON" | jq -r '.codedeploy_deployment_group_name.value // empty')
 ALB_DNS=$(echo "$TF_JSON" | jq -r '.alb_dns_name.value // empty')
-EC2_IPS=$(echo "$TF_JSON" | jq -r '.ec2_public_ips.value[]? // empty')
 
 if [ -z "$BACKEND_ECR_REPO" ] || [ -z "$FRONTEND_ECR_REPO" ] || [ -z "$S3_BUCKET" ] || [ -z "$CODEDEPLOY_APP" ] || [ -z "$ECR_REGISTRY" ]; then
   echo "❌ Error: No se pudieron obtener los outputs de Terraform. ¿Ya ejecutaste 'terraform apply' en el directorio infra/main/?"
@@ -73,11 +72,15 @@ echo "📦 Empaquetando artefactos de despliegue (appspec.yml, docker-compose.ym
 BUNDLE_FILE="/tmp/bundle-${IMAGE_TAG}.zip"
 rm -f "$BUNDLE_FILE"
 
-# Se empaqueta desde una carpeta temporal para añadir archivos generados sin ensuciar el repo
+# Se empaqueta desde una carpeta temporal para añadir archivos generados sin ensuciar el repo.
+# Solo viajan al bundle los hooks de CodeDeploy definidos en appspec.yml,
+# mas VERSION/VALIDATE_SLEEP que escriben estos scripts. Las utilidades locales
+# (deploy_local.sh, test_alb.sh, Prueba_observabilidad.sh...) no se copian.
 STAGE_DIR="$(mktemp -d)"
 cp appspec.yml docker-compose.yml "$STAGE_DIR/"
-cp -r scripts "$STAGE_DIR/scripts"
-rm -f "$STAGE_DIR/scripts/deploy_local.sh"
+mkdir -p "$STAGE_DIR/scripts"
+cp scripts/before_install.sh scripts/after_install.sh \
+   scripts/start_app.sh scripts/validate_service.sh "$STAGE_DIR/scripts/"
 
 # Versión de imagen de ESTA revisión (la lee start_app.sh)
 echo "$IMAGE_TAG" > "$STAGE_DIR/scripts/VERSION"
@@ -88,7 +91,8 @@ echo "${VALIDATE_SLEEP_SECONDS:-0}" > "$STAGE_DIR/scripts/VALIDATE_SLEEP"
 rm -rf "$STAGE_DIR"
 
 echo "☁️ Subiendo bundle a Amazon S3 (s3://${S3_BUCKET}/releases/app-${IMAGE_TAG}.zip)..."
-aws s3 cp "$BUNDLE_FILE" "s3://${S3_BUCKET}/releases/app-${IMAGE_TAG}.zip"
+aws s3 cp "$BUNDLE_FILE" "s3://${S3_BUCKET}/releases/app-${IMAGE_TAG}.zip" \
+  --region "$AWS_REGION"
 rm -f "$BUNDLE_FILE"
 
 # 6. Crear despliegue en CodeDeploy
@@ -100,12 +104,13 @@ DEPLOYMENT_ID=$(aws deploy create-deployment \
   --s3-location "bucket=${S3_BUCKET},key=releases/app-${IMAGE_TAG}.zip,bundleType=zip" \
   --description "Despliegue local tag ${IMAGE_TAG}" \
   --query "deploymentId" \
-  --output text)
+  --output text \
+  --region "$AWS_REGION")
 
 echo "✅ Despliegue creado con ID: $DEPLOYMENT_ID"
 echo ""
 echo "⏳ Monitoreando estado del despliegue en CodeDeploy..."
-aws deploy wait deployment-successful --deployment-id "$DEPLOYMENT_ID" && DEPLOY_SUCCESS=true || DEPLOY_SUCCESS=false
+aws deploy wait deployment-successful --deployment-id "$DEPLOYMENT_ID" --region "$AWS_REGION" && DEPLOY_SUCCESS=true || DEPLOY_SUCCESS=false
 
 if [ "$DEPLOY_SUCCESS" = true ]; then
   echo "🎉 ¡Despliegue completado con éxito!"
@@ -115,15 +120,10 @@ if [ "$DEPLOY_SUCCESS" = true ]; then
     echo "   👉 App (ALB): http://${ALB_DNS}"
     echo "   👉 Backend Health (ALB): http://${ALB_DNS}/api/health"
   fi
-  if [ -n "$EC2_IPS" ]; then
-    echo "   (Instancias EC2 individuales:)"
-    for IP in $EC2_IPS; do
-      echo "   - http://${IP}:3000"
-    done
-  fi
 else
   echo "⚠️ El despliegue falló, fue detenido o sigue en progreso."
   aws deploy get-deployment --deployment-id "$DEPLOYMENT_ID" \
+    --region "$AWS_REGION" \
     --query 'deploymentInfo.{estado:status,error:errorInformation}' --output json
   exit 1
 fi
