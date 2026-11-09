@@ -132,3 +132,12 @@ variable "codedeploy_traffic_control" {
   type        = bool
   default     = true
 }
+
+
+# Variables para la parte de despliegue de la aplicación (CodeDeploy)
+# ------------------------------------------------------------------------------
+variable "codedeploy_blue_green" {
+  description = "false = IN_PLACE (primer despliegue de un entorno nuevo); true = Blue/Green"
+  type        = bool
+  default     = false
+}

@@ -30,18 +30,17 @@ provider "aws" {
 }
 
 locals {
-  public_subnet_names     = ["gh-subnet-a", "gh-subnet-b"]
-  route_table_name        = "gh-route-table"
-  elb_security_group      = "gh-security-group-elb"
-  ec2_security_group      = "gh-security-group-ec2"
-  gateway_name            = "gh-gateway"
-  target_group_name       = "gh-tg"
-  target_group_green_name = "gh-tg-green"
-  load_balancer_name      = "gh-elb"
-  asg_name                = "gh-asg"
-  launch_template_name    = "gh-template"
-  codedeploy_app_name     = "mi-app"
-  deployment_group_name   = "produccion"
+  public_subnet_names   = ["gh-subnet-a", "gh-subnet-b"]
+  route_table_name      = "gh-route-table"
+  elb_security_group    = "gh-security-group-elb"
+  ec2_security_group    = "gh-security-group-ec2"
+  gateway_name          = "gh-gateway"
+  target_group_name     = "gh-tg"
+  load_balancer_name    = "gh-elb"
+  asg_name              = "gh-asg"
+  launch_template_name  = "gh-template"
+  codedeploy_app_name   = "mi-app"
+  deployment_group_name = "produccion"
 }
 
 # ==============================================================================
@@ -366,32 +365,7 @@ resource "aws_lb_target_group" "app_tg" {
   }
 }
 # 
-resource "aws_lb_target_group" "green" {
-  name        = local.target_group_green_name
-  port        = var.app_port
-  protocol    = "HTTP"
-  vpc_id      = aws_vpc.main.id
-  target_type = "instance"
 
-  deregistration_delay = var.deregistration_delay
-
-  health_check {
-    enabled             = true
-    path                = var.health_check_path
-    port                = "traffic-port"
-    protocol            = "HTTP"
-    interval            = 30
-    timeout             = 5
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-    matcher             = "200"
-  }
-
-  tags = {
-    Name        = local.target_group_green_name
-    Environment = var.environment
-  }
-}
 
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
@@ -402,9 +376,7 @@ resource "aws_lb_listener" "http" {
     type             = "forward"
     target_group_arn = aws_lb_target_group.app_tg.arn
   }
-  lifecycle {
-    ignore_changes = [default_action]
-  }
+
 }
 
 # ==============================================================================
@@ -611,10 +583,11 @@ resource "aws_iam_role_policy_attachment" "codedeploy_service" {
 
 # Grupo de despliegue apuntando al Auto Scaling Group y coordinado con el Target Group
 resource "aws_codedeploy_deployment_group" "main" {
-  app_name               = aws_codedeploy_app.main.name
-  deployment_group_name  = local.deployment_group_name
-  service_role_arn       = aws_iam_role.codedeploy_service_role.arn
-  deployment_config_name = "CodeDeployDefault.OneAtATime"
+  app_name              = aws_codedeploy_app.main.name
+  deployment_group_name = local.deployment_group_name
+  service_role_arn      = aws_iam_role.codedeploy_service_role.arn
+  # Config predefinida válida para EC2/On-Premises (incl. blue/green con tráfico controlado)
+  deployment_config_name = "CodeDeployDefault.AllAtOnce"
 
   # Despliegue al Auto Scaling Group (en lugar de EC2 fija por tag)
   autoscaling_groups = [aws_autoscaling_group.app_asg.name]
@@ -638,16 +611,8 @@ resource "aws_codedeploy_deployment_group" "main" {
   }
 
   load_balancer_info {
-    target_group_pair_info {
-      prod_traffic_route {
-        listener_arns = [aws_lb_listener.http.arn]
-      }
-      target_group {
-        name = aws_lb_target_group.app_tg.name # azul
-      }
-      target_group {
-        name = aws_lb_target_group.green.name
-      }
+    target_group_info {
+      name = aws_lb_target_group.app_tg.name
     }
   }
 

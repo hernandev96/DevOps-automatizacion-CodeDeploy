@@ -29,14 +29,20 @@ systemctl start docker
 usermod -a -G docker ec2-user
 
 # Instalar Docker Compose v2 (CLI plugin y binario compatible)
+# IMPORTANTE: los assets se publican como docker-compose-linux-<arch> (minúsculas).
+# Usar $(uname -s) produce "Linux" (mayúscula) y descarga un 404/HTML -> exec format error.
 DOCKER_CONFIG_DIR="/usr/local/lib/docker/cli-plugins"
 mkdir -p "$DOCKER_CONFIG_DIR" /usr/libexec/docker/cli-plugins /usr/local/bin
-DOCKER_COMPOSE_URL="https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)"
-curl -sSL "$DOCKER_COMPOSE_URL" -o /usr/local/bin/docker-compose
+COMPOSE_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+COMPOSE_ARCH="$(uname -m)"
+DOCKER_COMPOSE_URL="https://github.com/docker/compose/releases/latest/download/docker-compose-$${COMPOSE_OS}-$${COMPOSE_ARCH}"
+curl -fsSL "$DOCKER_COMPOSE_URL" -o /usr/local/bin/docker-compose
 chmod +x /usr/local/bin/docker-compose
 ln -sf /usr/local/bin/docker-compose "$DOCKER_CONFIG_DIR/docker-compose"
 ln -sf /usr/local/bin/docker-compose /usr/libexec/docker/cli-plugins/docker-compose
 ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+# Verificación rápida: si falla aquí, user_data cae temprano y no deja instancias "a medias"
+docker compose version
 
 echo "=== [4/7] Preparando el archivo de logs de los contenedores ==="
 # Este paso va ANTES de iniciar el agente de CodeDeploy a proposito: si un
