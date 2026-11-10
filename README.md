@@ -268,8 +268,9 @@ hooks:
 | `before_install.sh`        | `rm -rf /opt/mi-app && mkdir -p /opt/mi-app` (nace limpio)                                                                                |
 | `after_install.sh`         | `chmod +x /opt/mi-app/scripts/*.sh`                                                                                                       |
 | `start_app.sh`             | Resuelve región/cuenta (IMDSv2 → STS), `docker login` ECR con el rol IAM, `compose pull/down/up -d`, `prune`                              |
-| `validate_service.sh`      | Espera opcional `VALIDATE_SLEEP` (demo de rollback) + reintenta `curl localhost/api/health` 12×5s → 200                                   |
-| `deploy_local.sh`          | Script **local** (no viaja en el bundle): lee outputs TF, login ECR, build+push, zip mínimo, `s3 cp`, `deploy create-deployment` + `wait` |
+| `validate_service.sh`      | Espera opcional `VALIDATE_SLEEP` (demo/prueba de rollback) + reintenta `curl localhost/api/health` 12×5s → 200                            |
+| `deploy_local.sh`          | Script **local** (no viaja en el bundle): lee outputs TF, login ECR, build+push, zip mínimo, `s3 cp`, `deploy create-deployment` + `wait`. Soporta `VALIDATE_SLEEP_SECONDS`. |
+| `test_rollback.sh`         | Script **local** para probar rollback: estado, despliegue con fallo forzado (`trigger-fail`), monitoreo y rollback manual (`manual-rollback`). |
 | `test_alb.sh`              | Prueba de carga/balanceo del ALB (reporte `report_test_alb.md`)                                                                           |
 | `Prueba_observabilidad.sh` | Valida CloudWatch/CodeDeploy/ALB (reporte `reporte_observabilidad.md`)                                                                    |
 
@@ -338,11 +339,17 @@ Autenticación siempre **OIDC** (sin claves estáticas): cada workflow asume `va
 
 ---
 
-## 9. Cómo ejecutar
+## 9. Cómo ejecutar (despliegue manual paso a paso)
+
+Esta sección explica el flujo **manual** en dos fases:
+1. **Despliegue normal** (una revisión simple, validando la app y el pipeline).
+2. **Configuración para Blue/Green** (infraestructura lista para cambios sin downtime y con rollback).
+
+> En este repositorio, `infra/main` ya está configurado para **Blue/Green + control de tráfico** (`BLUE_GREEN + WITH_TRAFFIC_CONTROL`) con Auto Scaling Group, ALB y CodeDeploy. Si partes desde cero, sigue las fases en orden para entender qué se configura y por qué.
 
 ### Prerrequisitos
 
-- [AWS CLI v2](https://aws.amazon.com/cli/), [Docker](https://www.docker.com/), [Terraform](https://www.terraform.io/) >= 1.0, `jq`, `zip`, credenciales AWS configuradas.
+- [AWS CLI v2](https://aws.amazon.com/cli/), [Docker](https://www.docker.com/), [Terraform](https://www.terraform.io/) >= 1.0, `jq`, `zip`, `git`, credenciales AWS configuradas.
 - Cuenta AWS con permisos para crear los recursos (o el rol bootstrap).
 
 ### Paso 1 — Bootstrap (una vez)
@@ -355,34 +362,168 @@ terraform apply
 # y verificar el backend S3 que usa infra/main
 ```
 
-### Paso 2 — Infraestructura principal
+### Paso 2 — Fase A: Despliegue normal (primera revisión)
+
+Objetivo: validar que la app se construye, publica imágenes y se despliega correctamente.
+
+1. **Aprovisionar la infraestructura base** (VPC, ALB, Target Group principal, ASG, ECR, S3, CodeDeploy):
+
+   ```bash
+   cd infra/main
+   terraform init
+   terraform validate
+   terraform plan
+   terraform apply
+   ```
+
+   Guarda el DNS del balanceador:
+
+   ```bash
+   ALB=$(terraform output -raw alb_dns_name)
+   ```
+
+2. **Construir y publicar imágenes (normal)** — opción manual:
+
+   ```bash
+   AWS_REGION=$(terraform -chdir=infra/main output -raw aws_region)
+   ECR_REGISTRY=$(terraform -chdir=infra/main output -raw ecr_registry_url)
+   BACKEND_REPO=$(terraform -chdir=infra/main output -raw ecr_backend_repository_url)
+   FRONTEND_REPO=$(terraform -chdir=infra/main output -raw ecr_frontend_repository_url)
+   IMAGE_TAG=$(git rev-parse --short HEAD)
+
+   aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+   docker build --platform linux/amd64 -t "${BACKEND_REPO}:${IMAGE_TAG}" -t "${BACKEND_REPO}:latest" ./backend
+   docker build --platform linux/amd64 -t "${FRONTEND_REPO}:${IMAGE_TAG}" -t "${FRONTEND_REPO}:latest" ./frontend
+   docker push "${BACKEND_REPO}:${IMAGE_TAG}" && docker push "${BACKEND_REPO}:latest"
+   docker push "${FRONTEND_REPO}:${IMAGE_TAG}" && docker push "${FRONTEND_REPO}:latest"
+   ```
+
+3. **Desplegar la revisión (normal)** — el script automatiza build+push+bundle+CodeDeploy:
+
+   ```bash
+   chmod +x scripts/deploy_local.sh
+   ./scripts/deploy_local.sh
+   ```
+
+   El script: lee outputs de Terraform → build/push ECR → genera bundle (`appspec.yml`, `docker-compose.yml`, hooks en `scripts/`) → sube a S3 → crea despliegue en CodeDeploy → espera éxito.
+
+4. **Verificar el despliegue normal**:
+
+   ```bash
+   curl -s "http://${ALB}/api/health"   # debe responder 200
+   curl -s "http://${ALB}/"             # SPA React
+   ```
+
+   > Desde SSM Session Manager puedes inspeccionar las instancias sin abrir SSH.
+
+### Paso 3 — Fase B: Configurar infraestructura para Blue/Green
+
+Objetivo: que cada despliegue cree una **flota verde** nueva, valide la app y **mueva el tráfico** del ALB sin downtime; si falla, **rollback automático**.
+
+La configuración Blue/Green en este repo vive en `infra/main/main.tf` y `infra/main/observability.tf`:
+
+1. **ALB + Target Groups (azul/verde)**
+   - `aws_lb_target_group.app_tg` (azul, principal): recibe tráfico inicial.
+   - `aws_lb_target_group.app_tg_green` (verde): usado por CodeDeploy durante el despliegue.
+   - Health check idéntico: `GET /api/health` → 200.
+
+2. **Listener con control de tráfico**
+   - El listener HTTP del ALB enruta al Target Group azul por defecto.
+   - CodeDeploy (con `WITH_TRAFFIC_CONTROL`) cambia el `default_action` del listener hacia el Target Group verde cuando la nueva flota está sana.
+   - Terraform ignora cambios en `default_action` para no pelear con CodeDeploy.
+
+3. **CodeDeploy Blue/Green (ASG)**
+   - `deployment_style`: `BLUE_GREEN` + `WITH_TRAFFIC_CONTROL`.
+   - `green_fleet_provisioning_option`: `COPY_AUTO_SCALING_GROUP` (copia el ASG actual para la flota verde).
+   - `terminate_blue_instances_on_deployment_success`: termina instancias azules tras el cambio de tráfico (con tiempo de gracia).
+   - `load_balancer_info.target_group_info`: apunta al Target Group principal (azul).
+
+4. **Observabilidad y rollback automático**
+   - Alarma CloudWatch `gh-alb-5xx` (HTTP 5xx del ALB > 0 en 1 min) registrada en el Deployment Group.
+   - `auto_rollback_configuration`: activa rollback en `DEPLOYMENT_FAILURE` y `DEPLOYMENT_STOP_ON_ALARM`.
+
+Aplicar/corregir la configuración (si hiciste cambios manuales o migraste desde in-place):
 
 ```bash
 cd infra/main
-terraform init
-terraform validate
 terraform plan
 terraform apply
-# Guardar alb_dns_name  (terraform output alb_dns_name)
 ```
 
-### Paso 3 — Despliegue local
+**Nota importante (migración manual desde in-place):** si tu Deployment Group existía como _in-place_, no siempre es posible cambiarlo directamente a Blue/Green sin recrearlo. En ese caso, planifica la migración (ventana de mantenimiento, nuevo DG o recreación controlada) y valida en un entorno de prueba primero. En este repositorio, la infraestructura se define declarativamente en Terraform para mantener consistencia.
+
+### Paso 4 — Despliegue Blue/Green (operación normal)
+
+Cada nuevo despliegue repite el flujo de la Fase A (nueva versión de imágenes + bundle + CodeDeploy), pero CodeDeploy ejecuta:
+1. Provisiona flota **verde** (copia del ASG).
+2. Instala la revisión y levanta contenedores.
+3. Ejecuta hooks (`BeforeInstall` → `AfterInstall` → `ApplicationStart` → `ValidateService`).
+4. Mueve el tráfico del ALB (azul → verde).
+5. Termina la flota azul si todo fue exitoso.
 
 ```bash
-chmod +x scripts/deploy_local.sh
 ./scripts/deploy_local.sh
-# El script: lee outputs TF → build/push ECR → bundle ZIP → S3 → CodeDeploy
 ```
 
-### Verificación
+### Paso 5 — Rollback (ejemplo práctico)
+
+En Blue/Green, el rollback puede ser **automático** (por fallo o alarma) o **manual**.
+
+#### Rollback automático
+- Ocurre si falla un hook de CodeDeploy o si se activa la alarma `gh-alb-5xx` durante el despliegue.
+- CodeDeploy detiene el cambio de tráfico y/o revierte al estado anterior (según el punto del ciclo).
+- Verifica el estado:
 
 ```bash
-ALB=$(terraform -chdir=infra/main output -raw alb_dns_name)
-curl -s http://${ALB}/api/health   # debe responder 200
-curl -s http://${ALB}/             # SPA React
+APP=$(terraform -chdir=infra/main output -raw codedeploy_app_name)
+DG=$(terraform -chdir=infra/main output -raw codedeploy_deployment_group_name)
+REGION=$(terraform -chdir=infra/main output -raw aws_region)
+aws deploy list-deployments --application-name "$APP" --deployment-group-name "$DG" --region "$REGION" --max-items 5 --output table
 ```
 
-> Desde SSM Session Manager (`AWS-RunShellScript` / `AWS-StartInteractiveCommand`) se puede inspeccionar cada EC2 sin abrir SSH.
+#### Probar rollback con script (recomendado)
+
+Usa `scripts/test_rollback.sh` para ejecutar una prueba controlada:
+
+```bash
+chmod +x scripts/test_rollback.sh
+
+# Ver estado actual (deployment group, alarmas, últimos despliegues)
+./scripts/test_rollback.sh status
+
+# Disparar despliegue de prueba que fuerza espera en ValidateService
+# (da tiempo a observar/forzar condiciones de rollback según tu configuración)
+VALIDATE_SLEEP_SECONDS=120 ./scripts/test_rollback.sh trigger-fail
+
+# Monitorear el despliegue (o pasar DEPLOYMENT_ID)
+./scripts/test_rollback.sh monitor
+
+# Si hay un despliegue en progreso y necesitas revertir manualmente:
+./scripts/test_rollback.sh manual-rollback
+```
+
+> `ValidateService` usa `scripts/VALIDATE_SLEEP` (inyectado en el bundle) para simular demora. Para una demo de rollback por alarma, genera condiciones que disparen 5xx en el ALB durante el despliegue (por ejemplo, pruebas controladas contra endpoints que fallen) o usa `manual-rollback` para practicar la operación.
+
+#### Rollback manual (volver a una revisión estable)
+
+Si el despliegue terminó pero quieres volver atrás, redespliega una **revisión anterior** (bundle en S3) que sepas que funciona:
+
+```bash
+# Listar revisiones/bundles en S3
+BUCKET=$(terraform -chdir=infra/main output -raw s3_bucket_name)
+aws s3 ls "s3://${BUCKET}/releases/"
+
+# Crear un despliegue usando un bundle anterior (ejemplo)
+APP=$(terraform -chdir=infra/main output -raw codedeploy_app_name)
+DG=$(terraform -chdir=infra/main output -raw codedeploy_deployment_group_name)
+REGION=$(terraform -chdir=infra/main output -raw aws_region)
+aws deploy create-deployment \
+  --application-name "$APP" \
+  --deployment-group-name "$DG" \
+  --s3-location "bucket=${BUCKET},key=releases/app-<TAG_ANTERIOR>.zip,bundleType=zip" \
+  --description "Rollback manual a revisión estable <TAG_ANTERIOR>" \
+  --region "$REGION"
+```
 
 ### Desarrollo local (sin AWS)
 
@@ -393,7 +534,6 @@ pip install -r requirements.txt && uvicorn main:app --reload --port 8000
 # Frontend
 cd frontend && npm install && npm start   # http://localhost:3000
 ```
-
 ---
 
 ## 10. Variables y outputs Terraform (referencia)
@@ -434,7 +574,7 @@ cd frontend && npm install && npm start   # http://localhost:3000
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | Balanceo / carga ALB | `scripts/test_alb.sh` (`-u URL -n 200 -c 10 --target-group --asg-name -r region -o report_test_alb.md`)                                        | URLs servidas, distribución entre instancias, latencia, endpoints autenticados                      |
 | Observabilidad       | `scripts/Prueba_observabilidad.sh` (`-u -r -a mi-app -g produccion -t TG -l loggroup -d dashboard -m gh-alb-5xx -o reporte_observabilidad.md`) | Logs recientes, métricas, alarmas, estado del grupo de despliegue                                   |
-| Demo de rollback     | `VALIDATE_SLEEP_SECONDS=120 ./scripts/deploy_local.sh`                                                                                         | La espera en `validate_service.sh` da tiempo a que la alarma 5xx dispare y CodeDeploy haga rollback |
+| Prueba de rollback   | `./scripts/test_rollback.sh status` · `VALIDATE_SLEEP_SECONDS=120 ./scripts/test_rollback.sh trigger-fail` · `./scripts/test_rollback.sh monitor` · `./scripts/test_rollback.sh manual-rollback` | Ejecuta/monitorea un despliegue de prueba y práctica de rollback (automático por fallo/alarma o manual por detención/redespliegue de revisión estable) |
 
 Los reportes se publican en el **Step Summary** y como **artefactos** de GitHub Actions.
 
@@ -449,7 +589,7 @@ Si prefieres recorrer cada servicio a mano (consola / AWS CLI) antes de automati
 3. [S3](./docs/s3.md)
 4. [VPC y red](./docs/vpc.md)
 5. [EC2](./docs/ec2.md)
-6. [CodeDeploy](./docs/codedeploy.md)
+6. [CodeDeploy](./docs/codedeploy.md) — muestra un ejemplo **in-place** (despliegue normal/manual). Para Blue/Green con tráfico controlado, compara con `infra/main/main.tf` y la sección 9.
 7. [Limpieza](./docs/cleanup.md)
 
 ---

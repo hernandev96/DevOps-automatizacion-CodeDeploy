@@ -176,11 +176,17 @@ jobs:
               --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
               --output text 2>/dev/null || echo "0")
 
-            echo "Intento $ATTEMPT/$MAX_ATTEMPTS — HTTP Code: $STATUS | Targets Saludables: $HEALTHY_TARGETS"
+            echo "Intento $ATTEMPT/$MAX_ATTEMPTS — HTTP Code: $STATUS | Targets saludables (TG monitoreado): $HEALTHY_TARGETS"
 
-            if [ "$STATUS" = "200" ] && [ "$HEALTHY_TARGETS" -gt 0 ]; then
+            # En Blue/Green, CodeDeploy puede mover/terminar targets del TG original.
+            # La señal principal de disponibilidad para el usuario es HTTP 200 en /api/health vía ALB.
+            if [ "$STATUS" = "200" ]; then
               HEALTHY=true
-              echo "✅ ALB saludable y respondiendo con éxito (HTTP 200)."
+              if [ "$HEALTHY_TARGETS" -gt 0 ]; then
+                echo "✅ ALB saludable y respondiendo con éxito (HTTP 200, targets healthy en TG)."
+              else
+                echo "✅ ALB responde HTTP 200. No hay targets healthy en el TG monitoreado (posible estado Blue/Green post-cambio); se considera saludable."
+              fi
               break
             fi
 

@@ -594,19 +594,23 @@ resource "aws_codedeploy_deployment_group" "main" {
 
   # Tipo Blue/Green coordinado con el Target Group para drenar tráfico durante la actualización
   deployment_style {
-    deployment_type   = "BLUE_GREEN"
+    deployment_type   = var.codedeploy_blue_green ? "BLUE_GREEN" : "IN_PLACE"
     deployment_option = "WITH_TRAFFIC_CONTROL"
   }
-  blue_green_deployment_config {
-    deployment_ready_option {
-      action_on_timeout = "CONTINUE_DEPLOYMENT"
-    }
-    green_fleet_provisioning_option {
-      action = "COPY_AUTO_SCALING_GROUP" # sin esto el despliegue no puede crear el entorno verde
-    }
-    terminate_blue_instances_on_deployment_success {
-      action                           = "TERMINATE"
-      termination_wait_time_in_minutes = 5
+
+  dynamic "blue_green_deployment_config" {
+    for_each = var.codedeploy_blue_green ? [1] : []
+    content {
+      deployment_ready_option {
+        action_on_timeout = "CONTINUE_DEPLOYMENT"
+      }
+      green_fleet_provisioning_option {
+        action = "COPY_AUTO_SCALING_GROUP"
+      }
+      terminate_blue_instances_on_deployment_success {
+        action                           = "TERMINATE"
+        termination_wait_time_in_minutes = 5
+      }
     }
   }
 
