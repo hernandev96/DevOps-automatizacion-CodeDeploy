@@ -62,10 +62,7 @@ variable "github_subject_claims" {
   default = [
 
 
-    "repo:DevOPS-Practicas@279809259/p08_1_Observabilidad_Rollback_CloudWatch@1412464040:ref:refs/heads/main",
-    "repo:DevOPS-Practicas@279809259/p08_1_Observabilidad_Rollback_CloudWatch@1412464040:ref:refs/heads/release/*",
-    "repo:DevOPS-Practicas@279809259/p08_1_Observabilidad_Rollback_CloudWatch@1412464040:pull_request",
-    "repo:DevOPS-Practicas@279809259/p08_1_Observabilidad_Rollback_CloudWatch@1412464040:merge"
+    "Aqui van los repositorios a implementar el OIDC"
   ]
 }
 
